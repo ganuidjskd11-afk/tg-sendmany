@@ -1,0 +1,142 @@
+# 用 GitHub 的 macOS runner 编译 Telegram-iOS（不需要 Mac）
+#
+# 思路：runner 上现拉上游源码 → 注入我们的群发页面 → 用仓库自带的 Make.py 出 IPA →
+# 上传 artifact。本仓库只放插件源码和这份 workflow，不存上游代码。
+#
+# 触发：仓库 → Actions → Build IPA → Run workflow
+#   inject_plugin = true  带上群发页面
+#   inject_plugin = false 纯上游，用来验证流水线本身
+
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "上游 tag"
+        required: false
+        default: "release-11.0"
+      inject_plugin:
+        description: "注入群发插件（true/false）"
+        required: false
+        default: "false"
+      build_number:
+        description: "Build number"
+        required: false
+        default: "100001"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 330
+
+    env:
+      SRC: ${{ github.workspace }}/src
+      OUT: ${{ github.workspace }}/out
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 清磁盘
+        run: |
+          df -h /
+          sudo rm -rf ~/Library/Developer/Xcode/DerivedData || true
+          sudo rm -rf /Users/runner/Library/Developer/CoreSimulator/Caches/* || true
+          df -h /
+
+      - name: 拉上游源码（含子模块）
+        run: |
+          git clone --recursive --depth 1 --branch "${{ github.event.inputs.tag }}" \
+            https://github.com/TelegramMessenger/Telegram-iOS.git "$SRC"
+          cd "$SRC"
+          git log -1 --oneline
+          cat versions.json
+
+      - name: 注入群发插件
+        if: ${{ github.event.inputs.inject_plugin == 'true' }}
+        run: |
+          mkdir -p "$SRC/Telegram/Sources/SendMany"
+          cp plugin/Swift/*.swift "$SRC/Telegram/Sources/SendMany/"
+          ls -la "$SRC/Telegram/Sources/SendMany/"
+          if [ -f plugin/patches/add_entry.py ]; then
+            python3 plugin/patches/add_entry.py "$SRC"
+          fi
+
+      - name: 写构建配置
+        run: |
+          cp ci_build/config/appstore-config.json "$SRC/build-system/sendmany-configuration.json"
+          cat "$SRC/build-system/sendmany-configuration.json"
+
+      - name: 选 Xcode
+        id: xcode
+        run: |
+          WANT=$(python3 -c "import json;print(json.load(open('$SRC/versions.json'))['xcode'])")
+          echo "上游要求 Xcode $WANT"
+          ls -d /Applications/Xcode*.app || true
+          if [ -d "/Applications/Xcode_${WANT}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${WANT}.app"
+          else
+            LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+            sudo xcode-select -s "$LATEST"
+            echo "没有 $WANT，用 $LATEST（会加 --overrideXcodeVersion）"
+          fi
+          xcodebuild -version | head -1
+
+      - name: 生成 Xcode 工程
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -o pipefail
+          cd "$SRC"
+          python3 build-system/Make/Make.py \
+            --cacheDir="$SRC/.bazel-cache" \
+            --overrideXcodeVersion \
+            generateProject \
+            --configurationPath=build-system/sendmany-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            2>&1 | tee "$GITHUB_WORKSPACE/generate.log"
+
+      - name: 构建 IPA
+        run: |
+          set -o pipefail
+          cd "$SRC"
+          mkdir -p "$OUT"
+          python3 build-system/Make/Make.py \
+            --cacheDir="$SRC/.bazel-cache" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath=build-system/sendmany-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=${{ github.event.inputs.build_number }} \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath="$OUT" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 收集产物
+        if: always()
+        run: |
+          ls -la "$OUT" || true
+          find "$SRC" -maxdepth 3 -name "*.ipa" 2>/dev/null || true
+          if [ ! -f "$OUT/Telegram.ipa" ]; then
+            FOUND=$(find "$SRC" -name "*.ipa" | head -1 || true)
+            if [ -n "$FOUND" ]; then cp "$FOUND" "$OUT/Telegram.ipa"; fi
+          fi
+          ls -la "$OUT" || true
+
+      - name: 上传 IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ipa
+          path: out/
+          if-no-files-found: warn
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            generate.log
+            build.log
+          if-no-files-found: ignore
