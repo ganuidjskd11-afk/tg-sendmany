@@ -1,0 +1,103 @@
+# Codemagic 构建配置 —— 没有 Mac 时的另一条路
+#
+# 用法：
+#   1. 注册 https://codemagic.io/signup（用 GitHub 授权最省事）
+#   2. Add application → 选 GitHub → 选 tg-sendmany 仓库
+#   3. Codemagic 会自动读到本文件，选 workflows 里的 "ios-unsigned" → Start new build
+#   4. 跑完在 Artifacts 里下 IPA，TrollStore 安装
+#
+# 免费额度：每月 500 分钟 macOS 构建（具体以它当前定价页为准）。
+# 这个工程一次构建大概 60~120 分钟，所以一个月能跑 4~8 次。
+
+workflows:
+  ios-unsigned:
+    name: Telegram 11.0 未签名 IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      vars:
+        UPSTREAM_TAG: "release-11.0"
+        BUILD_NUMBER: "100001"
+        INJECT_PLUGIN: "false"
+    scripts:
+      - name: 清磁盘
+        script: |
+          df -h / 2>/dev/null || true
+          rm -rf ~/Library/Developer/Xcode/DerivedData || true
+          rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
+          df -h / 2>/dev/null || true
+
+      - name: 拉上游源码（含子模块）
+        script: |
+          git clone --recursive --depth 1 --branch "$UPSTREAM_TAG" \
+            https://github.com/TelegramMessenger/Telegram-iOS.git src
+          cd src && git log -1 --oneline && cat versions.json
+
+      - name: 注入群发插件
+        script: |
+          if [ "$INJECT_PLUGIN" = "true" ]; then
+            mkdir -p src/Telegram/Sources/SendMany
+            cp plugin/Swift/*.swift src/Telegram/Sources/SendMany/
+            ls -la src/Telegram/Sources/SendMany/
+          else
+            echo "INJECT_PLUGIN=false，跳过（纯上游基线）"
+          fi
+
+      - name: 写构建配置
+        script: |
+          cp ci_build/config/appstore-config.json src/build-system/sendmany-configuration.json
+          cat src/build-system/sendmany-configuration.json
+
+      - name: 选 Xcode
+        script: |
+          WANT=$(python3 -c "import json;print(json.load(open('src/versions.json'))['xcode'])")
+          echo "上游要求 Xcode $WANT"
+          ls -d /Applications/Xcode*.app || true
+          if [ -d "/Applications/Xcode_${WANT}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${WANT}.app"
+          else
+            LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+            sudo xcode-select -s "$LATEST"
+            echo "没有 $WANT，用 $LATEST（构建时加 --overrideXcodeVersion）"
+          fi
+          xcodebuild -version
+
+      - name: 生成 Xcode 工程
+        script: |
+          cd src
+          python3 build-system/Make/Make.py \
+            --cacheDir="$PWD/.bazel-cache" \
+            --overrideXcodeVersion \
+            generateProject \
+            --configurationPath=build-system/sendmany-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            2>&1 | tee "$CM_BUILD_DIR/generate.log"
+
+      - name: 构建 IPA
+        script: |
+          cd src
+          mkdir -p "$CM_BUILD_DIR/out"
+          python3 build-system/Make/Make.py \
+            --cacheDir="$PWD/.bazel-cache" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath=build-system/sendmany-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber="$BUILD_NUMBER" \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath="$CM_BUILD_DIR/out" \
+            2>&1 | tee "$CM_BUILD_DIR/build.log"
+
+      - name: 收集产物
+        script: |
+          ls -la "$CM_BUILD_DIR/out" || true
+          if [ ! -f "$CM_BUILD_DIR/out/Telegram.ipa" ]; then
+            FOUND=$(find src -name "*.ipa" | head -1 || true)
+            if [ -n "$FOUND" ]; then cp "$FOUND" "$CM_BUILD_DIR/out/Telegram.ipa"; fi
+          fi
+          ls -la "$CM_BUILD_DIR/out" || true
+
+    artifacts:
+      - out/*.ipa
+      - generate.log
+      - build.log
